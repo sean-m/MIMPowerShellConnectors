@@ -199,6 +199,124 @@ try {
                         Remove-Variable -Scope Global -Name AllUsers -Force -ErrorAction Ignore
                     }
                 }
+                
+                'Group' {
+                    Write-Log -Message 'Processing Groups'
+                    try {
+                        # If this is first run, $Global:AllUsers does not exist and this will throw
+                        $null = Get-Variable -Scope Global -Name AllUsers -ErrorAction Stop -ValueOnly
+                        Write-Log -Message 'Not first run, using existing user array'
+                    } catch {
+                        # Get list of all users
+                        Write-Log -Message 'Getting Groups'
+
+                        $SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+                        $UserName = $Credential.UserName
+                        $Password = $Credential.GetNetworkCredential().Password
+                        $PartitionDN = $OpenImportConnectionRunStep.StepPartition.DN
+                        $Server = $ConfigParameters.Server
+                        $DeltaPropertiesToLoad = $null
+                        if($null -ne $Server) {
+                            $SearchRoot = "LDAP://$Server/$PartitionDN"
+                        } else {
+                            $SearchRoot = "LDAP://$PartitionDN"
+                        }
+
+                        $ArgumentList = $SearchRoot, $UserName, $Password
+                        $DirectoryEntry = New-Object -TypeName 'System.DirectoryServices.DirectoryEntry' -ArgumentList $ArgumentList
+
+                        $Searcher = New-Object -TypeName 'System.DirectoryServices.DirectorySearcher' -ArgumentList $DirectoryEntry, "(&(objectCategory=group)(objectClass=user))", $DeltaPropertiesToLoad, $SearchScope
+                        if($OpenImportConnectionRunStep.ImportType -eq 'Delta') {
+                            $Searcher.TombStone = $true
+                        }
+                        $Searcher.CacheResults = $false
+
+                        if ($null -eq $CustomData.watermark.DirSyncCookie) {
+                            $Searcher.directorysynchronization = new-object -TypeName system.directoryservices.directorysynchronization
+                        } else {
+                            # grab the watermark from last run and pass that to the searcher
+                            $DirSyncCookie = ,[System.Convert]::FromBase64String($CustomData.WaterMark.DirSyncCookie)
+                            $Searcher.directorysynchronization = new-object -TypeName system.directoryservices.directorysynchronization -ArgumentList $DirSyncCookie
+                        }
+                        $Global:AllUsers = $Searcher.FindAll()
+                        $null = $Global:AllUsers.Count
+                        $Global:DirSyncCookieString = [System.Convert]::ToBase64String($Searcher.DirectorySynchronization.GetDirectorySynchronizationCookie())
+                    }
+
+                    $EndIndex = [Math]::Min(($Global:AllUsers.Count-1),($StartIndex + $PageSize - 1))
+
+                    Write-Log -Message "Processing groups in batch $StartIndex..$EndIndex"
+
+                    # Loop over users in current batch
+                    for($i = $StartIndex;$i -le $EndIndex; $i++) {
+                        $User = $Global:AllUsers[$i]
+
+                        if($User.Properties.isdeleted) {
+                            if($OpenImportConnectionRunStep.ImportType -eq 'Delta') {
+                                $csEntry = New-xADSyncPSConnectorCSEntryChange -ObjectType $ObjectType -ModificationType 'Delete' -DN $User.Properties.'distinguishedname'
+                                Add-xADSyncPSConnectorCSAnchor -InputObject $csEntry -Name 'objectGuid' -Value $User.Properties.'objectguid'[0]
+                                $csEntries.Add($csEntry)
+                            }
+                        } else {
+                            if($OpenImportConnectionRunStep.ImportType -eq 'Delta') {
+                                $ModificationType = 'Update'
+                            } else {
+                                $ModificationType = 'Add'
+                            }
+                            $csEntry = New-xADSyncPSConnectorCSEntryChange -ObjectType $ObjectType -ModificationType $ModificationType -DN $User.Properties.'distinguishedname'
+                            # Process Attributes
+
+                            if($null -ne $User.Properties.'samaccountname') {
+                                Get-CSAttributeChange -InputObject $csEntry -ColumnsToImport $columnsToImport -Attribute 'sAMAccountName' -Value $User.Properties.'samaccountname'[0] -ModificationType $ModificationType
+                            }
+
+                            if($null -ne $User.Properties.'mailnickname') {
+                                Get-CSAttributeChange -InputObject $csEntry -ColumnsToImport $columnsToImport -Attribute 'mailNickname' -Value $User.Properties.'mailnickname'[0] -ModificationType $ModificationType
+                            }
+
+                            if($null -ne $User.Properties.'objectguid') {
+                                Get-CSAttributeChange -InputObject $csEntry -ColumnsToImport $columnsToImport -Attribute 'objectGuid' -Value $User.Properties.'objectguid'[0] -ModificationType $ModificationType
+                            }
+
+                            if($User.Properties.Contains('msexchmailboxguid')) {
+                                if($User.Properties.'msexchmailboxguid'.Count -eq 1) {
+                                    Get-CSAttributeChange -InputObject $csEntry -ColumnsToImport $columnsToImport -Attribute '_isMailboxEnabled' -Value $true -ModificationType $ModificationType
+                                } else {
+                                    Get-CSAttributeChange -InputObject $csEntry -ColumnsToImport $columnsToImport -Attribute '_isMailboxEnabled' -Value $false -ModificationType $ModificationType
+                                }
+                            }
+
+                            if($User.Properties.Contains('msexchrecipienttypedetails')) {
+                                if($User.Properties.'msexchrecipienttypedetails'.Count -eq 1) {
+                                    $MailboxType = switch($User.Properties.'msexchrecipienttypedetails') {
+                                        {$_ -band 0x80000000} {
+                                            'RemoteMailbox'
+                                            break
+                                        }
+
+                                        {$_ -band 1} {
+                                            'Mailbox'
+                                            break
+                                        }
+                                    }
+                                    Get-CSAttributeChange -InputObject $csEntry -ColumnsToImport $columnsToImport -Attribute '_MailboxType' -Value $MailboxType  -ModificationType $ModificationType
+                                } elseif ($OpenImportConnectionRunStep.ImportType -eq 'Delta') {
+                                    Get-CSAttributeChange -InputObject $csEntry -ColumnsToImport $columnsToImport -Attribute '_MailboxType' -ModificationType 'Delete'
+                                }
+                            }
+
+                            $csEntries.Add($csEntry)
+                        }
+
+                    }
+
+                    if($EndIndex -lt ($Global:AllUsers.Count - 1)) {
+                        $customData.WaterMark.$ObjectType.MoreToImport = '1'
+                    } else {
+                        $customData.WaterMark.$ObjectType.MoreToImport = '0'
+                        Remove-Variable -Scope Global -Name AllUsers -Force -ErrorAction Ignore
+                    }
+                }
             }
         }
     }

@@ -57,7 +57,7 @@ $UserBaseAttributes = @{
     '_MailboxType' = @{Multivalued=$False;DataType='String';SupportedOperation='ImportExport'}
     '_isMailboxEnabled' = @{Multivalued=$False;DataType='Boolean';SupportedOperation='ImportExport'}
 }
-foreach($TypeName in 'User') {
+foreach($TypeName in @('User','Group')) {
     Write-Log -Message "Processing $Type Schema"
 
     $TypeObject = New-xADSyncPSConnectorSchemaType -Name $TypeName

@@ -161,6 +161,46 @@ try {
                         break
                     }
 
+                    'Group' {
+                        try {
+
+                            $Guid = [guid][byte[]]$Entry.AnchorAttributes.Where{$_.Name -eq 'ObjectGuid'}.Value | Foreach-Object -MemberName ToString
+                            $MailNickname = $Entry.AttributeChanges.Where{$_.Name -eq 'mailNickname'}.ValueChanges.Value
+
+                            $MailboxParams = @{
+                                Identity = $Guid
+                                Alias = $MailNickname
+                            }
+
+                            if (-not [string]::IsNullOrWhiteSpace($ConfigParameters.Server)) {
+                                $MailboxParams.Add('DomainController',$ConfigParameters.Server)
+                            }
+
+                            if($Entry.AttributeChanges.Where{$_.Name -eq '_MailboxType'}.ValueChanges.Value -eq 'Mailbox') {
+                                # Mailbox type set to Mailbox, enable mailbox
+                                $null = Enable-Mailbox @MailboxParams -ErrorAction 'Stop'
+                            } elseif ($Entry.AttributeChanges.Where{$_.Name -eq '_MailboxType'}.ValueChanges.Value -eq 'RemoteMailbox') {
+                                # Mailbox type set to RemoteMailbox, enable in cloud
+                                $null = Enable-RemoteMailbox @MailboxParams -ErrorAction 'Stop'
+                            } elseif (-not $Entry.AttributeChanges.Where{$_.Name -eq '_MailboxType'}) {
+                                # Mailbox type deleted, disable mailbox
+                                if($MailboxParams.ContainsKey('Alias')) { $MailboxParams.Remove('Alias') }
+                                $null = Disable-Mailbox @MailboxParams -Confirm:$False -ErrorAction 'Stop'
+                            }
+
+                            $ChangeResult = New-xADEntryChangeResult -Identifier $Entry.Identifier -AttributeChanges $Entry.AttributeChanges -ErrorCode 'Success'
+
+                        } catch {
+                            try {
+                                Write-Log -Message ($_ | ConvertTo-Json -Depth 3 -ErrorAction Stop | Out-String )
+                            } catch {
+                                Write-Log -Message "MailboxError: Some objects are not serializable to JSON, no error details are shown."
+                            }
+                            $ChangeResult = New-xADEntryChangeResult -Identifier $Entry.Identifier -AttributeChanges $Entry.AttributeChanges -ErrorCode 'ExportErrorCustomContinueRun' -ErrorName 'script-error' -ErrorDetail "$($_.Exception.Message)"
+                        }
+                        break
+                    }
+
                     default {
                         $ChangeResult = New-xADEntryChangeResult -Identifier $Entry.Identifier -AttributeChanges $Entry.AttributeChanges -ErrorCode 'ExportErrorCustomContinueRun' -ErrorName 'script-error' -ErrorDetail "Unsupported object type: $($Entry.ObjectType)"
                     }
